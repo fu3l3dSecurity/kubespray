@@ -1,0 +1,416 @@
+#Swimlane on k8s using Kubespray - Assumptions/requirements:
+-root access to all hosts
+-k8s user with $upersecret pass and part of sudoers
+-internet accesss on all hosts to download required packages
+-Provision (recommended) [7]->[10] k8s nodes using CentOS 7 x86_64 1810 and 1-2 FE HA-Proxy/F5 Load Balancers or the like:
+	-Bastion / Ctrl (Used to Manage & Provision Cluster):
+		-2vCPUs
+		-2-4GB RAM
+		-50GB SSD (Thin)
+		-1 NIC (Enabled on boot)
+	-Each Master [3/5] k8s nodes should have at least:
+		-2-4vCPUs
+		-4-8GB RAM
+		-50GB SSD (Thin)
+		-1 NIC (Enabled on boot)
+	-Each etcd [3/5] k8s hosts should have at least
+		-2-4vCPUs
+		-4-8GB RAM
+		-50GB SSD (Thin)
+		-1 NIC (Enabled on boot)
+	-Each Worker [3+] k8s nodes should have at least:
+		-4-8vCPUs
+		-16-64GB RAM
+		-250GB-2TB SSD (Thin)
+		  - Rook will provision data in /data/rook so ensure the /data directory has the majority of the space.
+		-1 NIC (Enabled on boot)
+
+**Ensure your load balancer is up and running prior to install
+
+#Example (minimum) [6] node with [1] bastion controller (recommended) & [2] Load balancers/ [1] VIP:
+vip.domain.tld 			192.168.0.90 (HA-Proxy/L5 or other LB)
+k8s-master-01.domain.tld 	192.168.0.91
+k8s-master-02.domain.tld 	192.168.0.92
+k8s-master-03.domain.tld 	192.168.0.93
+k8s-etcd-01.domain.tld 	192.168.0.94
+k8s-etcd-02.domain.tld 	192.168.0.95
+k8s-etcd-03.domain.tld 	192.168.0.96
+k8s-worker-01.domain.tld 	192.168.0.97
+k8s-worker-02.domain.tld	192.168.0.98
+k8s-worker-03.domain.tld	192.168.0.99
+k8s-ctrl.domain.tld		192.168.0.100
+
+-RECOMMENDED: Create a wildcard dns entry like *.kubernetes.domain.local and resolve to VIP.  There are multiple services that will be brought online and can be run through VIP.  Having wildcard dns will simplify and allow you to continue to spin up new services as needed.
+-Domain names used during this setup:
+	swimlane.your.domain.tld
+	traefik.your.domain.tld
+	K8s.your.domain.tld
+	dashboard.domain.tld
+	rook-ceph.your.domain.tld
+	weave.your.domain.tld
+-OPTIONAL: Create a wildcard ssl certificate that is trusted in your domain to load onto HAProxy or generate from CA
+
+#On bastion host (as k8s user):
+su - k8s 
+sudo yum update -y
+sudo yum install net-tools ntp open-vm-tools epel-release yum-utils nano git wget bind-utils bash-completion ansible -y
+sudo easy_install pip
+sudo pip install --upgrade setuptools
+sudo pip2 install jinja2 requests --upgrade
+sudo yum install python36 python36-setuptools -y
+sudo easy_install-3.6 pip
+declare -a IPS=(192.168.0.91 192.168.0.92 192.168.0.93 192.168.0.94 192.168.0.95 192.168.0.96 192.168.0.97 192.168.0.98 192.168.0.99)
+
+#optional:
+sudo pip install --upgrade pip
+sudo python3 -m pip install --upgrade pip
+
+#Generate ssh key (passphrase optional)
+ssh-keygen
+
+#OPTIONAL:
+for host in ${IPS[@]}; do ssh-copy-id root@$host; done
+
+#(OPTIONAL) Create User On all hosts
+curl -sSL https://ps-downloads.s3.amazonaws.com/k8s/create_users.sh -o create_users.sh && chmod +x create_users.sh
+#Change the password on line 2
+nano create_users.sh
+for host in ${IPS[@]}; do ssh root@$host "bash -s" < create_users.sh; done
+
+#Copy ssh key to all other hosts (root & k8s user - if not doing a root install)
+for host in ${IPS[@]}; do ssh-copy-id k8s@$host; done
+
+#Install pre-reqs for k8s cluster
+curl -sSL https://ps-downloads.s3.amazonaws.com/k8s/kube_prereqs_install.sh -o kube_prereqs_install.sh && chmod +x kube_prereqs_install.sh
+for host in ${IPS[@]}; do ssh k8s@$host "bash -s" < kube_prereqs_install.sh; done
+
+#Optional - Cleanup, Shutdown & Snapshot all hosts:
+sudo package-cleanup --oldkernels --count=1 -y
+/bin/rm -f /home/*/.bash_history
+unset HISTFILE
+sudo -i
+yum clean -q all
+/usr/sbin/logrotate -f /etc/logrotate.conf
+/bin/rm -f /var/log/*-???????? /var/log/*.gz
+/bin/rm -f /var/log/dmesg.old
+/bin/rm -rf /var/log/anaconda
+/bin/cat /dev/null > /var/log/audit/audit.log
+/bin/cat /dev/null > /var/log/wtmp
+/bin/cat /dev/null > /var/log/lastlog
+/bin/cat /dev/null > /var/log/grubby
+/sbin/service rsyslog stop > /dev/null
+/sbin/service auditd stop > /dev/null
+/bin/rm -rf /tmp/*
+/bin/rm -rf /var/tmp/*
+/bin/rm -f ~root/anaconda-ks.cfg
+/bin/rm -f ~root/.bash_history
+/bin/rm -f /home/*/.bash_history
+unset HISTFILE
+systemctl poweroff -i
+
+#After verifying proper snapshots -> Bring all hosts back online and ssh to ctrl:
+sudo nano /etc/yum.repos.d/kubernetes.repo
+
+[kubernetes]
+name=Kubernetes
+baseurl=https://packages.cloud.google.com/yum/repos/kubernetes-el7-x86_64
+enabled=1
+gpgcheck=1
+repo_gpgcheck=1
+gpgkey=https://packages.cloud.google.com/yum/doc/yum-key.gpg https://packages.cloud.google.com/yum/doc/rpm-package-key.gpg
+
+sudo yum install -y kubectl
+source <(kubectl completion bash)
+echo "source <(kubectl completion bash)" >> ~/.bashrc
+curl -L https://git.io/get_helm.sh | bash
+git clone --branch v2.10.4 https://github.com/kubernetes-sigs/kubespray.git
+cd kubespray
+sudo pip install -r requirements.txt
+pip3 install -r requirements.txt --user
+cp -rfp inventory/sample inventory/swimlane-k8s
+declare -a IPS=(192.168.0.91 192.168.0.92 192.168.0.93 192.168.0.94 192.168.0.95 192.168.0.96 192.168.0.97 192.168.0.98 192.168.0.99)
+CONFIG_FILE=inventory/swimlane-k8s/hosts.yml python36 contrib/inventory_builder/inventory.py ${IPS[@]}
+#Update hosts file:
+#Need 3 Masters and 3 etd servers.  They can be on same nodes if need be. Remove calico lines if using weave.
+nano inventory/swimlane-k8s/hosts.yml
+
+#Update Network to weave and bring down kubeconfig to localhost: 
+nano ./inventory/swimlane-k8s/group_vars/k8s-cluster/k8s-cluster.yml
+kube_network_plugin: weave
+kubeconfig_localhost: true
+kubectl_localhost: true
+supplementary_addresses_in_ssl_keys: [VIP_OF_LOADBALANCER]
+
+#Update Volume Location:
+nano roles/kubernetes/node/defaults/main.yml
+#Change to:
+kubelet_flexvolumes_plugins_dir: /usr/libexec/kubernetes/kubelet-plugins/volume/exec/
+#Enable helm:
+nano ./inventory/swimlane-k8s/group_vars/k8s-cluster/addons.yml
+helm_enabled: true
+#Uncomment apiserver_loadbalancer_domain_name loadbalancer_apiserver and all properties
+nano inventory/swimlane-k8s/group_vars/all/all.yml
+## External LB example config
+#apiserver_loadbalancer_domain_name: "vip.domain.tld"
+#loadbalancer_apiserver:
+#  address: 192.168.0.90
+#  port: 6443
+#Begin Ansible Bootstrap (as k8s):
+ansible-playbook -b -i inventory/swimlane-k8s/hosts.yml cluster.yml
+#Or - Begin Ansible Bootstrap (as root):
+ansible-playbook -i inventory/swimlane-k8s/hosts.yml --become --become-user=root cluster.yml
+
+#Once Playbook has completed building your k8s-cluster:
+mkdir ~/.kube
+cp ~/kubespray/inventory/swimlane-k8s/artifacts/admin.conf ~/.kube/config
+
+#Verify status:
+kubectl get nodes
+kubectl get svc -n kube-system
+kubectl cluster-info
+kubectl get pods -o wide --all-namespaces
+
+#Create user for dashboard access and print token
+kubectl create serviceaccount dash-admin
+# Assign new account right permissions
+kubectl create clusterrolebinding dash-admin-cadmin --clusterrole=cluster-admin --serviceaccount=default:dash-admin
+kubectl create clusterrolebinding dash-admin-admin --clusterrole=admin --serviceaccount=default:dash-admin
+# show the token needed to log in to the dashboard (store in vault/password safe)
+kubectl -n default describe secret $(kubectl -n default get secret | awk '/^dash-admin-token-/{print $1}') | awk '$1=="token:"{print $2}'
+
+#Initialize and configure Helm:
+helm init --upgrade
+kubectl create serviceaccount --namespace kube-system tiller
+kubectl create clusterrolebinding tiller-cluster-rule --clusterrole=cluster-admin --serviceaccount=kube-system:tiller
+kubectl patch deploy --namespace kube-system tiller-deploy -p '{"spec":{"template":{"spec":{"serviceAccount":"tiller"}}}}'      
+helm init --service-account tiller --upgrade
+
+#Verify tiller is online
+helm version
+
+#Create a chart directory to store all configuration files and charts:
+mkdir ~/charts
+cd ~/charts
+
+#Install and Configure Traefik
+helm fetch stable/traefik --untar
+curl -sSL "https://ps-downloads.s3.amazonaws.com/k8s/traefik-values.yaml" -o ./traefik/values.yaml
+helm install traefik --name traefik --namespace kube-system --set dashboard.domain="traefik.example.domain"
+
+#Check to see which node port maps to port 443 for the traefik deployment.  This will be needed for the load balancer config
+kubectl get svc -n kube-system
+
+#Configure storage:
+helm repo add rook-stable https://charts.rook.io/stable
+helm repo update
+helm install --namespace rook-ceph-system --version v0.9.3 rook-stable/rook-ceph
+#Wait for all rook-ceph-agents and rook-discovers to be running
+kubectl get pods -n rook-ceph-system -w
+
+#Apply Rook-Ceph Base Storage Config
+curl -sSL "https://ps-downloads.s3.amazonaws.com/k8s/ceph-cluster.yaml" -o ceph-cluster.yaml
+curl -sSL "https://ps-downloads.s3.amazonaws.com/k8s/ceph-fs.yaml" -o ceph-fs.yaml
+curl -sSL "https://ps-downloads.s3.amazonaws.com/k8s/ceph-blockpool.yaml" -o ceph-blockpool.yaml
+curl -sSL "https://ps-downloads.s3.amazonaws.com/k8s/ceph-storageclass.yaml" -o ceph-storageclass.yaml
+
+kubectl apply -f ceph-cluster.yaml
+kubectl apply -f ceph-fs.yaml
+kubectl apply -f ceph-blockpool.yaml
+kubectl apply -f ceph-storageclass.yaml
+
+#Wait for rook-ceph-mon-a b and c to be running
+kubectl get pods -n rook-ceph -w
+
+#Apply ingress rule for ceph dashboard and update default fqdn for rook ceph dashboard
+curl -sSL "https://ps-downloads.s3.amazonaws.com/k8s/ceph-dashboad-ingress.yaml" -o ceph-dashboad-ingress.yaml
+kubectl apply -f ceph-dashboad-ingress.yaml
+kubectl edit -n rook-ceph ingress rook-ceph-mgr-dashboard
+
+#Might take a minute or 2 for the dashboard to come up.
+#Visit the dashboard - Username is admin
+#To retrieve the password (Store in Vault Password Manager):
+kubectl -n rook-ceph get secret rook-ceph-dashboard-password -o jsonpath="{['data']['password']}" | base64 --decode && echo
+
+#Install and Configure Swimlane:
+helm repo add swimlane https://charts.swimlane.io
+helm repo update
+helm fetch swimlane/swimlane --untar
+
+#Update values to match your required config / credentials
+nano swimlane/values.yaml
+#Update the replicas for each container. 
+#update the hosts line with a resolvable FQDN.  
+#Update the imageCredentials. 
+#Enable chrome/selenium true if required and update latest version https://github.com/SeleniumHQ/docker-selenium/releases
+#Set thirdPartyCerts to false if not using internal CA
+#Change the flexVolume to enabled: true and persistenVolume to enabled: false under sharedfs.
+#Set the mongo password and encryption key (if special characters use single ' outside and escape single quotes with a single '
+#For mongo persistenVolume set the storageClass to "rook-ceph-block" and update the size to how big you want it to be.
+helm install swimlane --name swimlane --namespace swimlane
+
+#verify that all pods, services & storage are operational
+kubectl get sc
+kubectl get svc --all-namespaces
+kubectl get pvc --all-namespaces
+kubectl get pv --all-namespaces
+kubectl get pods -w
+
+#Optional (Weave/):
+curl -sSL "https://cloud.weave.works/k8s/scope.yaml?k8s-version=$(kubectl version | base64 | tr -d '\n')&k8s-service-type=NodePort" -o weave.yaml
+kubectl apply -f weave.yaml
+htpasswd -bc auth admin 'UR4Swimlane!'
+cat auth
+kubectl create secret generic mysecret --from-file auth --namespace=weave
+curl -sSL "https://ps-downloads.s3.amazonaws.com/k8s/weave-ingress.yaml" -o weave-ingress.yaml
+kubectl apply -f weave-ingress.yaml
+
+##APPENDIX
+#Sample inventory/swimlane-k8s/hosts.yml file:
+all:
+  hosts:
+    ps-master01:
+      ansible_host: 10.20.32.120
+      ip: 10.20.32.120
+      access_ip: 10.20.32.120
+    ps-master02:
+      ansible_host: 10.20.32.121
+      ip: 10.20.32.121
+      access_ip: 10.20.32.121
+    ps-master03:
+      ansible_host: 10.20.32.122
+      ip: 10.20.32.122
+      access_ip: 10.20.32.122
+    ps-worker01:
+      ansible_host: 10.20.32.123
+      ip: 10.20.32.123
+      access_ip: 10.20.32.123
+    ps-worker02:
+      ansible_host: 10.20.32.124
+      ip: 10.20.32.124
+      access_ip: 10.20.32.124
+    ps-worker03:
+      ansible_host: 10.20.32.125
+      ip: 10.20.32.125
+      access_ip: 10.20.32.125
+  children:
+    kube-master:
+      hosts:
+        ps-master01:
+        ps-master02:
+        ps-master03:
+    kube-node:
+      hosts:
+        ps-worker01:
+        ps-worker02:
+        ps-worker03:
+    etcd:
+      hosts:
+        ps-master01:
+        ps-master02:
+        ps-master03:
+    k8s-cluster:
+      children:
+        kube-master:
+        kube-node:
+
+#Sample haproxy config:
+#---------------------------------------------------------------------
+# Example configuration for a possible web application.  See the
+# full configuration options online.
+#
+#   http://haproxy.1wt.eu/download/1.4/doc/configuration.txt
+#
+#---------------------------------------------------------------------
+
+#---------------------------------------------------------------------
+# Global settings
+#---------------------------------------------------------------------
+global
+    # to have these messages end up in /var/log/haproxy.log you will
+    # need to:
+    #
+    # 1) configure syslog to accept network log events.  This is done
+    #    by adding the '-r' option to the SYSLOGD_OPTIONS in
+    #    /etc/sysconfig/syslog
+    #
+    # 2) configure local2 events to go to the /var/log/haproxy.log
+    #   file. A line like the following can be added to
+    #   /etc/sysconfig/syslog
+    #
+    #    local2.*                       /var/log/haproxy.log
+    #
+    log         127.0.0.1:514 local0 debug
+
+    chroot      /var/lib/haproxy
+    pidfile     /var/run/haproxy.pid
+    maxconn     4000
+    user        haproxy
+    group       haproxy
+    daemon
+
+    # turn on stats unix socket
+    stats socket /var/lib/haproxy/stats
+    tune.ssl.default-dh-param 2048
+    ssl-server-verify none
+    ssl-default-bind-options  no-sslv3 no-tlsv10 no-tlsv11 no-tls-tickets
+    ssl-default-bind-ciphers ECDH+AESGCM:ECDH+CHACHA20:DH+AESGCM:ECDH+AES256:DH+AES256:ECDH+AES128:DH+AES:!RSA+AESGCM:!RSA+AES:!aNULL:!MD5:!DSS
+    ssl-default-server-options no-sslv3 no-tlsv10 no-tlsv11 no-tls-tickets
+    ssl-default-server-ciphers ECDH+AESGCM:ECDH+CHACHA20:DH+AESGCM:ECDH+AES256:DH+AES256:ECDH+AES128:DH+AES:!RSA+AESGCM:!RSA+AES:!aNULL:!MD5:!DSS
+
+#---------------------------------------------------------------------
+# common defaults that all the 'listen' and 'backend' sections will
+# use if not designated in their block
+#---------------------------------------------------------------------
+defaults
+    mode                    http
+    log                     global
+    option                  httplog
+    option                  dontlognull
+    option http-server-close
+    option forwardfor       except 127.0.0.0/8
+    option                  redispatch
+    retries                 3
+    timeout http-request    10s
+    timeout queue           1m
+    timeout connect         10s
+    timeout client          1m
+    timeout server          1m
+    timeout http-keep-alive 10s
+    timeout check           10s
+    maxconn                 3000
+
+frontend  k8s
+    bind *:80
+    bind *:443 ssl crt /etc/ssl/ps-internal/swimlane.io.pem
+    http-request set-header X-Forwarded-Port %[dst_port]
+    http-request add-header X-Forwarded-Proto https if { ssl_fc }
+    rspadd Strict-Transport-Security:\ max-age=31536000
+    redirect scheme https if !{ ssl_fc }
+    mode http
+    default_backend k8s-traefik
+backend k8s-traefik
+    balance roundrobin
+    mode http
+    option forwardfor
+    server ps-worker01 10.20.32.123:30837 check
+    server ps-worker02 10.20.32.124:30837 check
+    server ps-worker03 10.20.32.125:30837 check
+    stats enable
+    stats hide-version
+    stats realm K8S\Haproxy\ Statistics
+    stats uri /haproxy
+
+frontend k8s-master
+    bind *:6443
+    mode tcp
+    option tcplog
+    default_backend k8s-api
+backend k8s-api
+    mode tcp
+    option tcplog
+    option tcp-check
+    balance roundrobin
+    default-server inter 10s downinter 5s rise 2 fall 2 slowstart 60s maxconn 250 maxqueue 256 weight 100
+    server ps-master01 10.20.32.120:6443 check
+    server ps-master02 10.20.32.121:6443 check
+    server ps-master03 10.20.32.122:6443 check
