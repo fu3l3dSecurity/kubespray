@@ -1,0 +1,20 @@
+apiVersion: extensions/v1beta1
+kind: Ingress
+metadata:
+  annotations:
+    kubernetes.io/ingress.class: traefik
+    ingress.kubernetes.io/auth-type: "basic"
+    ingress.kubernetes.io/auth-secret: "mysecret"
+  generation: 1
+  name: weave-ingress
+  namespace: weave
+spec:
+  rules:
+  - host: weave.ps-internal.swimlane.io
+    http:
+      paths:
+      - backend:
+          serviceName: weave-scope-app
+          servicePort: 80
+status:
+  loadBalancer: {}
