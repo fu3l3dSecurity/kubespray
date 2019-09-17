@@ -1,0 +1,55 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: swimlane-flask
+  labels:
+    service: swimlane-flask
+spec:
+  selector:
+    app: swimlane-flask
+  ports:
+  - port: 10000
+    targetPort: 10000
+---
+apiVersion: extensions/v1beta1
+kind: Ingress
+metadata:
+  name: flask-ingress
+  annotations:
+    kubernetes.io/ingress.class: traefik
+    ingress.kubernetes.io/protocol: https
+spec:
+  rules:
+  - host: flask.example.com
+    http:
+      paths:
+      - backend:
+          serviceName: swimlane-flask
+          servicePort: 10000
+---
+apiVersion: extensions/v1beta1
+kind: Deployment
+metadata:
+  name: swimlane-flask
+spec:
+  replicas: 2
+  template:
+    metadata:
+      labels:
+        app: swimlane-flask
+    spec:
+      containers:
+      - name: swimlane-flask
+        image: swimlane/swimlane-flask:0.1.2
+        ports:
+        - containerPort: 10000
+        env:
+          - name: SWIM_URL
+            value: https://sw-web:443
+          - name: PAT
+            valueFrom:
+              secretKeyRef:
+                name: swimlane-flask-pat
+                key: pat
+      imagePullSecrets:
+      - name: swimlane-swimlane
